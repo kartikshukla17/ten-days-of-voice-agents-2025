@@ -2,7 +2,7 @@ import logging
 import os
 import json
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -28,59 +28,85 @@ load_dotenv(".env.local")
 
 
 @function_tool
-async def save_order(
+async def save_wellness(
     ctx: RunContext,
-    drinkType: str,
-    size: str,
-    milk: str,
-    extras: List[str],
-    name: str,
+    mood: str,
+    energy: str,
+    objectives: List[str],
+    notes: Optional[str] = None,
 ) -> str:
-    """Save the completed order to a JSON file and return a short confirmation.
+    """Save a wellness check-in to `wellness_log.json` and return a short confirmation.
 
-    The agent should only call this tool once it has confirmed all fields with the user.
+    Schema (one entry):
+    {
+      "timestamp": "ISO string",
+      "mood": "user text",
+      "energy": "user text or scale",
+      "objectives": ["1..3 objectives"],
+      "notes": "optional agent summary"
+    }
     """
-    order = {
-        "drinkType": drinkType,
-        "size": size,
-        "milk": milk,
-        "extras": extras or [],
-        "name": name,
+
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "mood": mood,
+        "energy": energy,
+        "objectives": objectives or [],
+        "notes": notes or "",
     }
 
-    # Ensure orders directory exists next to this file (backend/orders)
+    # Place file next to the backend folder (one level up from this file)
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    orders_dir = os.path.join(base_dir, "orders")
-    os.makedirs(orders_dir, exist_ok=True)
+    path = os.path.join(base_dir, "wellness_log.json")
+    # Ensure file exists and is a JSON array
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f) or []
+        else:
+            data = []
+    except Exception:
+        data = []
 
-    ts = datetime.utcnow().isoformat(timespec="seconds").replace(":", "-")
-    filename = f"order_{ts}.json"
-    path = os.path.join(orders_dir, filename)
+    data.append(entry)
 
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(order, f, indent=2, ensure_ascii=False)
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
     return f"saved:{path}"
 
 
 class Assistant(Agent):
-    def __init__(self) -> None:
-        # Barista persona for "Bean & Brew". The agent should collect a compact
-        # order state from the user and persist it using the `save_order` tool.
-        super().__init__(
-            instructions=(
-                "You are a friendly barista for the coffee brand 'Bean & Brew'."
-                " Greet customers warmly and help them place a drink order."
-                " Maintain an order state with these fields:\n"
-                "{\n  \"drinkType\": \"string\",\n  \"size\": \"string\",\n  \"milk\": \"string\",\n  \"extras\": [\"string\"],\n  \"name\": \"string\"\n}"
-                "\nAsk clarifying questions until all fields are filled."
-                " When you have confirmed every field with the user, call the tool"
-                " `save_order(drinkType, size, milk, extras, name)` to persist the order," 
-                "then give a short friendly confirmation to the user that includes the customer's name and the saved file path returned by the tool."
-                " Always refuse to help with requests that are illegal, harmful, or unsafe."
-            ),
-            tools=[save_order],
+    def __init__(self, previous_entry: Optional[dict] = None) -> None:
+        # Wellness-focused companion: daily check-ins, non-diagnostic support
+        prev_note = ""
+        if previous_entry:
+            prev_ts = previous_entry.get("timestamp")
+            prev_mood = previous_entry.get("mood")
+            prev_energy = previous_entry.get("energy")
+            prev_obj = ", ".join(previous_entry.get("objectives", []))
+            prev_note = (
+                f"Last time ({prev_ts}) you said your mood was '{prev_mood}' and energy was '{prev_energy}'. "
+                f"You were focusing on: {prev_obj}."
+            )
+
+        instructions = (
+            "You are a calm, grounded, and supportive health & wellness companion. "
+            "You are NOT a clinician and must not provide medical advice or diagnosis. "
+            "Your role is to do a short daily check-in: ask about mood, energy, and any stressors; "
+            "ask for 1–3 practical objectives for the day; offer short, realistic, non-medical suggestions; "
+            "and close with a concise recap and confirmation. "
+            "Keep suggestions small and actionable (e.g., take a 5-minute walk, break tasks into steps, drink water, take short breaks). "
+            "When the user confirms goals, persist the check-in by calling the tool"
+            " `save_wellness(mood, energy, objectives, notes)` with a brief agent summary sentence. "
+            "Always politely refuse harmful or unsafe requests. "
         )
+
+        # If a previous entry exists, include a brief reference that the agent can use
+        if prev_note:
+            instructions = prev_note + " " + instructions
+
+        super().__init__(instructions=instructions, tools=[save_wellness])
 
     # To add tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
@@ -171,9 +197,22 @@ async def entrypoint(ctx: JobContext):
     # # Start the avatar and wait for it to join
     # await avatar.start(session, room=ctx.room)
 
+    # Before starting, read the wellness log and pass the most recent entry to the Assistant
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    wellness_path = os.path.join(base_dir, "wellness_log.json")
+    last_entry = None
+    try:
+        if os.path.exists(wellness_path):
+            with open(wellness_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or []
+                if isinstance(data, list) and data:
+                    last_entry = data[-1]
+    except Exception:
+        last_entry = None
+
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(),
+        agent=Assistant(previous_entry=last_entry),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             # For telephony applications, use `BVCTelephony` for best results
