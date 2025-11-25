@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from datetime import datetime
+import asyncio
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -92,6 +93,17 @@ async def switch_mode(ctx: RunContext, mode: str) -> str:
         return f"unknown_mode:{m}"
 
     logger.info(f"Mode switch requested: {m}")
+
+    # Persist request so the running session can pick it up and update its TTS
+    try:
+        tmp_dir = os.path.join(BASE_DIR, "..", "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        path = os.path.join(tmp_dir, "day4_mode_request.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"mode": m, "ts": datetime.utcnow().isoformat()}, f)
+    except Exception:
+        logger.exception("failed to write mode request file")
+
     return f"switched:{m}"
 
 
@@ -172,6 +184,49 @@ async def entrypoint(ctx: JobContext):
         room=ctx.room,
         room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
+
+    # Start a background watcher that applies requested mode changes by updating session TTS
+    async def _watch_mode_requests():
+        tmp_dir = os.path.join(BASE_DIR, "..", "tmp")
+        path = os.path.join(tmp_dir, "day4_mode_request.json")
+        last_ts = None
+        while True:
+            try:
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    mode = data.get("mode")
+                    ts = data.get("ts")
+                    if ts != last_ts and mode in VOICE_MAP:
+                        last_ts = ts
+                        new_voice = VOICE_MAP[mode]
+                        try:
+                            session._tts = murf.TTS(
+                                voice=new_voice,
+                                style="Conversation",
+                                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+                                text_pacing=True,
+                            )
+                            logger.info(f"Updated session TTS to voice '{new_voice}' for mode '{mode}'")
+                        except Exception:
+                            logger.exception("Failed to update session TTS")
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Mode watcher error")
+                await asyncio.sleep(1.0)
+
+    watcher = asyncio.create_task(_watch_mode_requests())
+
+    async def _stop_watcher():
+        watcher.cancel()
+        try:
+            await watcher
+        except Exception:
+            pass
+
+    ctx.add_shutdown_callback(_stop_watcher)
 
     await ctx.connect()
 

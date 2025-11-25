@@ -76,6 +76,88 @@ async def save_wellness(
     return f"saved:{path}"
 
 
+@function_tool
+async def find_faq(ctx: RunContext, query: str) -> str:
+    """Find a best-effort FAQ answer from `company_data.json`.
+
+    This is a simple keyword-match search over FAQ entries. Returns the
+    matched answer or a fallback indicating no answer found.
+    """
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    data_path = os.path.join(base_dir, "company_data.json")
+    try:
+        with open(data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return "Sorry, I can't find the company FAQ right now."
+
+    faqs = data.get("faq", [])
+    q = (query or "").lower()
+    best = None
+    best_score = 0
+    for entry in faqs:
+        text = (entry.get("question", "") + " " + entry.get("answer", "")).lower()
+        # simple score: count of query words present
+        score = sum(1 for w in q.split() if w and w in text)
+        if score > best_score:
+            best_score = score
+            best = entry
+
+    if best and best_score > 0:
+        return f"FAQ: {best.get('question')}\nAnswer: {best.get('answer')}"
+    # fallback: if there's a short product summary, return that for general questions
+    summary = data.get("summary")
+    if summary and any(w in summary.lower() for w in q.split()):
+        return f"{summary}"
+
+    return "I don't have a direct answer in the FAQ for that — would you like me to connect you with a specialist or leave a message?"
+
+
+@function_tool
+async def save_lead(
+    ctx: RunContext,
+    name: Optional[str] = None,
+    company: Optional[str] = None,
+    email: Optional[str] = None,
+    role: Optional[str] = None,
+    use_case: Optional[str] = None,
+    team_size: Optional[str] = None,
+    timeline: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> str:
+    """Persist a lead as JSON in `leads.json` and return confirmation path."""
+
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "name": name or "",
+        "company": company or "",
+        "email": email or "",
+        "role": role or "",
+        "use_case": use_case or "",
+        "team_size": team_size or "",
+        "timeline": timeline or "",
+        "notes": notes or "",
+    }
+
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    path = os.path.join(base_dir, "leads.json")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f) or []
+        else:
+            data = []
+    except Exception:
+        data = []
+
+    data.append(entry)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    return f"saved:{path}"
+
+
 class Assistant(Agent):
     def __init__(self, previous_entry: Optional[dict] = None) -> None:
         # Wellness-focused companion: daily check-ins, non-diagnostic support
@@ -107,6 +189,34 @@ class Assistant(Agent):
             instructions = prev_note + " " + instructions
 
         super().__init__(instructions=instructions, tools=[save_wellness])
+
+
+
+class SDRAgent(Agent):
+    def __init__(self) -> None:
+        # Load a short company summary if available and craft SDR instructions
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        data_path = os.path.join(base_dir, "company_data.json")
+        summary = ""
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                summary = data.get("summary", "")
+        except Exception:
+            summary = ""
+
+        instructions = (
+            "You are a friendly, professional Sales Development Representative (SDR) for the company described in the provided company data. "
+            "Greet visitors warmly, ask what brought them here, and focus the conversation on understanding their needs. "
+            "Use the FAQ tool when asked product/company/pricing questions, and do not invent details not present in the FAQ or company content. "
+            "Collect lead information naturally during the conversation: name, company, email, role, use case, team size, and timeline. "
+            "When the user indicates they are done (e.g., 'That's all', 'Thanks', 'I'm done'), summarize the lead concisely and persist the lead by calling the tool `save_lead(...)`. "
+        )
+
+        if summary:
+            instructions = f"Company summary: {summary}\n" + instructions
+
+        super().__init__(instructions=instructions, tools=[find_faq, save_lead])
 
     # To add tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
@@ -211,8 +321,9 @@ async def entrypoint(ctx: JobContext):
         last_entry = None
 
     # Start the session, which initializes the voice pipeline and warms up the models
+    # Use the SDR agent persona so the assistant behaves like an SDR for the chosen company
     await session.start(
-        agent=Assistant(previous_entry=last_entry),
+        agent=SDRAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             # For telephony applications, use `BVCTelephony` for best results
